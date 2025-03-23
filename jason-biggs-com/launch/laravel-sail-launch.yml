@@ -1,0 +1,244 @@
+---
+# Ansible Playbook for Launching Laravel Sail
+# This playbook launches Laravel Sail after environment variables have been configured
+# Run this after running laravel-sail-prepare.yml and configuring your environment variables
+
+- name: Launch Laravel Sail with PostgreSQL
+  hosts: aws_ubuntu_servers
+  become: true
+  vars:
+    create_user: "admin"
+    project_dir: "/home/{{ create_user }}/jason-biggs-com_laravel"
+    # HTTPS related variables
+    enable_https: true
+    domain_name: "jasonbiggs.com"  # Replace with your actual domain
+    ssl_email: "your-email@example.com"  # Replace with your email
+
+  tasks:
+    # First check if ports are available before starting Laravel Sail
+    - name: Check if port 80 is in use
+      shell: lsof -i :80
+      register: port_80_check
+      ignore_errors: yes
+
+    - name: Stop Apache if running on port 80
+      systemd:
+        name: apache2
+        state: stopped
+        enabled: no
+      when: port_80_check.rc == 0
+      ignore_errors: yes
+
+    - name: Kill processes using port 80
+      shell: lsof -i :80 | grep -v PID | awk '{print $2}' | xargs -r kill -9
+      when: port_80_check.rc == 0
+      ignore_errors: yes
+
+    - name: Check if port 443 is in use
+      shell: lsof -i :443
+      register: port_443_check
+      ignore_errors: yes
+
+    - name: Kill processes using port 443
+      shell: lsof -i :443 | grep -v PID | awk '{print $2}' | xargs -r kill -9
+      when: port_443_check.rc == 0
+      ignore_errors: yes
+
+    - name: Check if port 5432 is in use
+      shell: lsof -i :5432
+      register: port_5432_check
+      ignore_errors: yes
+
+    - name: Kill processes using port 5432
+      shell: lsof -i :5432 | grep -v PID | awk '{print $2}' | xargs -r kill -9
+      when: port_5432_check.rc == 0
+      ignore_errors: yes
+
+    # Ensure UFW allows HTTPS traffic
+    - name: Ensure UFW is installed
+      apt:
+        name: ufw
+        state: present
+
+    - name: Check UFW status
+      shell: ufw status
+      register: ufw_status
+      changed_when: false
+      
+    - name: Enable UFW if not already enabled
+      shell: ufw --force enable
+      when: '"Status: active" not in ufw_status.stdout'
+      
+    - name: Allow HTTP traffic (port 80)
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+        
+    - name: Allow HTTPS traffic (port 443)
+      ufw:
+        rule: allow
+        port: '443'
+        proto: tcp
+        
+    - name: Allow PostgreSQL traffic (port 5432)
+      ufw:
+        rule: allow
+        port: '5432'
+        proto: tcp
+
+    # Generate Laravel application key if not already set
+    - name: Check if APP_KEY is set in .env
+      shell: grep -q "^APP_KEY=[^=]" {{ project_dir }}/.env
+      register: app_key_set
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Generate Laravel application key if not set
+      shell: cd {{ project_dir }} && sudo -u {{ create_user }} php artisan key:generate
+      environment:
+        HOME: "/home/{{ create_user }}"
+      when: app_key_set.rc != 0
+
+    # Configure Laravel for HTTPS in .env file
+    - name: Update APP_URL in .env for HTTPS
+      lineinfile:
+        path: "{{ project_dir }}/.env"
+        regexp: "^APP_URL="
+        line: "APP_URL=https://{{ domain_name }}"
+      when: enable_https
+
+    - name: Set FORCE_HTTPS in .env
+      lineinfile:
+        path: "{{ project_dir }}/.env"
+        regexp: "^FORCE_HTTPS="
+        line: "FORCE_HTTPS=true"
+        create: yes
+      when: enable_https
+
+    # Configure Laravel Sail to use HTTPS
+    - name: Check if docker-compose.yml exists
+      stat:
+        path: "{{ project_dir }}/docker-compose.yml"
+      register: docker_compose_file
+
+    - name: Create SSL directory in project
+      file:
+        path: "{{ project_dir }}/ssl"
+        state: directory
+        owner: "{{ create_user }}"
+        group: "{{ create_user }}"
+        mode: '0755'
+      when: enable_https
+
+    # Install certbot for SSL certificates if HTTPS is enabled
+    - name: Install certbot
+      apt:
+        name:
+          - certbot
+          - python3-certbot-nginx
+        state: present
+      when: enable_https
+
+    # Generate self-signed certificates for local development or when real certificates aren't available yet
+    - name: Generate self-signed certificates
+      shell: |
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+          -keyout {{ project_dir }}/ssl/server.key \
+          -out {{ project_dir }}/ssl/server.crt \
+          -subj "/CN={{ domain_name }}/O=Laravel/C=US"
+        chown {{ create_user }}:{{ create_user }} {{ project_dir }}/ssl/server.key {{ project_dir }}/ssl/server.crt
+      args:
+        creates: "{{ project_dir }}/ssl/server.crt"
+      when: enable_https
+
+    # Instead of becoming the user, use a simpler approach
+    - name: Start Laravel Sail
+      shell: |
+        cd {{ project_dir }}
+        chown -R {{ create_user }}:{{ create_user }} .
+        sudo -u {{ create_user }} bash vendor/bin/sail up -d
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: "/home/{{ create_user }}"
+
+    # Wait for Laravel Sail containers to be ready
+    - name: Wait for Laravel Sail containers to be ready
+      shell: sleep 10
+      changed_when: false
+
+    - name: Run database migrations
+      shell: cd {{ project_dir }} && sudo -u {{ create_user }} docker exec $(docker ps -q --filter name=laravel.test) php artisan migrate --force
+      environment:
+        HOME: "/home/{{ create_user }}"
+      ignore_errors: yes
+
+    # Configure Laravel trusted proxies for proper HTTPS detection
+    - name: Configure Laravel trusted proxies
+      shell: cd {{ project_dir }} && sudo -u {{ create_user }} docker exec $(docker ps -q --filter name=laravel.test) php artisan vendor:publish --provider="Fideloper\Proxy\TrustedProxyServiceProvider" --force
+      environment:
+        HOME: "/home/{{ create_user }}"
+      ignore_errors: yes
+      when: enable_https
+      
+    - name: Create custom trusted proxies config
+      copy:
+        dest: "{{ project_dir }}/config/trustedproxy.php"
+        content: |
+          <?php
+          
+          return [
+              /*
+               * Set trusted proxy IP addresses.
+               * To trust all proxies, use '*'
+               * To trust specific IPs, use comma separated values or an array
+               */
+              'proxies' => '*', // Trust all proxies
+              
+              /*
+               * To trust one or more specific proxies, use an array:
+               * 'proxies' => ['192.168.1.1', '192.168.1.2'],
+               */
+               
+              /*
+               * Set headers which should be used to detect proxies
+               */
+              'headers' => [
+                  Illuminate\Http\Request::HEADER_FORWARDED    => 'FORWARDED',
+                  Illuminate\Http\Request::HEADER_X_FORWARDED_FOR    => 'X_FORWARDED_FOR',
+                  Illuminate\Http\Request::HEADER_X_FORWARDED_HOST   => 'X_FORWARDED_HOST',
+                  Illuminate\Http\Request::HEADER_X_FORWARDED_PORT   => 'X_FORWARDED_PORT',
+                  Illuminate\Http\Request::HEADER_X_FORWARDED_PROTO  => 'X_FORWARDED_PROTO',
+              ]
+          ];
+        owner: "{{ create_user }}"
+        group: "{{ create_user }}"
+        mode: "0644"
+      when: enable_https
+
+    # Run npm build inside the Laravel Sail container
+    - name: Run npm build inside Laravel Sail container
+      shell: cd {{ project_dir }} && sudo -u {{ create_user }} docker exec $(docker ps -q --filter name=laravel.test) npm run build
+      environment:
+        HOME: "/home/{{ create_user }}"
+      ignore_errors: yes
+
+    - name: Display success message
+      debug:
+        msg: |
+          Laravel Sail with PostgreSQL has been successfully started! 
+          
+          Your Laravel application should now be running at:
+          {% if enable_https %}
+          - HTTPS: https://{{ domain_name }}
+          - HTTP: http://{{ domain_name }} (redirects to HTTPS)
+          {% else %}
+          - HTTP: http://{{ domain_name }}
+          {% endif %}
+          
+          * If you need to stop Laravel Sail, run:
+            cd {{ project_dir }} && sudo -u {{ create_user }} bash vendor/bin/sail down
+          
+          * To view Laravel Sail logs, run:
+            cd {{ project_dir }} && sudo -u {{ create_user }} bash vendor/bin/sail logs 
