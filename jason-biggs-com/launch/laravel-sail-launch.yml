@@ -1,9 +1,9 @@
 ---
-# Ansible Playbook for Launching Laravel Sail
+# Ansible Playbook for Launching Laravel Sail with Reverse Proxy SSL Setup
 # This playbook launches Laravel Sail after environment variables have been configured
 # Run this after running laravel-sail-prepare.yml and configuring your environment variables
 
-- name: Launch Laravel Sail with PostgreSQL
+- name: Launch Laravel Sail with PostgreSQL and Reverse Proxy SSL
   hosts: aws_ubuntu_servers
   become: true
   vars:
@@ -11,8 +11,9 @@
     project_dir: "/home/{{ create_user }}/jason-biggs-com_laravel"
     # HTTPS related variables
     enable_https: true
-    domain_name: "jasonbiggs.com"  # Replace with your actual domain
-    ssl_email: "your-email@example.com"  # Replace with your email
+    domain_name: "jason-biggs.com"
+    ssl_email: "admin@jason-biggs.com"
+    certbot_auto_renew: true
 
   tasks:
     # First check if ports are available before starting Laravel Sail
@@ -64,23 +65,23 @@
       shell: ufw status
       register: ufw_status
       changed_when: false
-      
+
     - name: Enable UFW if not already enabled
       shell: ufw --force enable
       when: '"Status: active" not in ufw_status.stdout'
-      
+
     - name: Allow HTTP traffic (port 80)
       ufw:
         rule: allow
         port: '80'
         proto: tcp
-        
+
     - name: Allow HTTPS traffic (port 443)
       ufw:
         rule: allow
         port: '443'
         proto: tcp
-        
+
     - name: Allow PostgreSQL traffic (port 5432)
       ufw:
         rule: allow
@@ -116,7 +117,7 @@
         create: yes
       when: enable_https
 
-    # Configure Laravel Sail to use HTTPS
+    # Configure Laravel Sail to use SSL (reverse proxy method)
     - name: Check if docker-compose.yml exists
       stat:
         path: "{{ project_dir }}/docker-compose.yml"
@@ -132,7 +133,7 @@
       when: enable_https
 
     # Install certbot for SSL certificates if HTTPS is enabled
-    - name: Install certbot
+    - name: Install certbot and dependencies
       apt:
         name:
           - certbot
@@ -140,19 +141,79 @@
         state: present
       when: enable_https
 
-    # Generate self-signed certificates for local development or when real certificates aren't available yet
-    - name: Generate self-signed certificates
-      shell: |
-        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-          -keyout {{ project_dir }}/ssl/server.key \
-          -out {{ project_dir }}/ssl/server.crt \
-          -subj "/CN={{ domain_name }}/O=Laravel/C=US"
-        chown {{ create_user }}:{{ create_user }} {{ project_dir }}/ssl/server.key {{ project_dir }}/ssl/server.crt
-      args:
-        creates: "{{ project_dir }}/ssl/server.crt"
+    - name: Check if certificate already exists
+      stat:
+        path: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
+      register: cert_exists
       when: enable_https
 
-    # Instead of becoming the user, use a simpler approach
+    - name: Stop nginx if running (to free port 80)
+      systemd:
+        name: nginx
+        state: stopped
+      when: enable_https and not cert_exists.stat.exists
+      ignore_errors: yes
+
+    - name: Obtain SSL certificate using Let's Encrypt
+      shell: |
+        certbot certonly --standalone \
+          --non-interactive \
+          --agree-tos \
+          --email {{ ssl_email }} \
+          --domains {{ domain_name }} \
+          --keep-until-expiring
+      when: enable_https and not cert_exists.stat.exists
+
+    - name: Create SSL directory in project if not exists
+      file:
+        path: "{{ project_dir }}/ssl"
+        state: directory
+        owner: "{{ create_user }}"
+        group: "{{ create_user }}"
+        mode: '0755'
+      when: enable_https
+
+    - name: Copy SSL certificates to project directory
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        remote_src: yes
+        owner: "{{ create_user }}"
+        group: "{{ create_user }}"
+        mode: "0644"
+      with_items:
+        - { src: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem", dest: "{{ project_dir }}/ssl/server.crt" }
+        - { src: "/etc/letsencrypt/live/{{ domain_name }}/privkey.pem", dest: "{{ project_dir }}/ssl/server.key" }
+      when: enable_https
+
+    # Setup auto-renewal for SSL certificates
+    - name: Create certbot renewal hook directory
+      file:
+        path: /etc/letsencrypt/renewal-hooks/deploy
+        state: directory
+        mode: '0755'
+      when: enable_https and certbot_auto_renew
+
+    - name: Create certificate renewal hook script
+      copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/copy-certs-to-laravel.sh
+        content: |
+          #!/bin/bash
+          cp /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem {{ project_dir }}/ssl/server.crt
+          cp /etc/letsencrypt/live/{{ domain_name }}/privkey.pem {{ project_dir }}/ssl/server.key
+          chown {{ create_user }}:{{ create_user }} {{ project_dir }}/ssl/server.*
+          docker compose -f {{ project_dir }}/docker-compose.yml restart
+        mode: '0755'
+      when: enable_https and certbot_auto_renew
+
+    - name: Add certbot renewal cron job
+      cron:
+        name: "Certbot Renewal"
+        job: "/usr/bin/certbot renew --quiet"
+        special_time: daily
+      when: enable_https and certbot_auto_renew
+
+    # Start Laravel Sail
     - name: Start Laravel Sail
       shell: |
         cd {{ project_dir }}
@@ -241,4 +302,17 @@
             cd {{ project_dir }} && sudo -u {{ create_user }} bash vendor/bin/sail down
           
           * To view Laravel Sail logs, run:
-            cd {{ project_dir }} && sudo -u {{ create_user }} bash vendor/bin/sail logs 
+            cd {{ project_dir }} && sudo -u {{ create_user }} bash vendor/bin/sail logs
+
+    # Update docker-compose.yml to map host port 8080 to container port 80
+    - name: Update docker-compose.yml for reverse proxy configuration
+      blockinfile:
+        path: "{{ project_dir }}/docker-compose.yml"
+        marker: "# {mark} ANSIBLE MANAGED REVERSE PROXY CONFIGURATION"
+        insertafter: "services:"
+        block: |
+            # Reverse Proxy Configuration for Laravel Sail
+            laravel.test:
+              ports:
+                - "8080:80"
+      when: enable_https and docker_compose_file.stat.exists
